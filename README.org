@@ -1,0 +1,238 @@
+#+TITLE: Using private keys in Sequoia
+#+AUTHOR: Wiktor Kwapisiewicz <wiktor@sequoia-pgp.org>
+#+DATE: January 27, 2022
+#+OPTIONS: H:2 toc:nil num:t
+#+startup: beamer
+#+LATEX_CLASS: beamer
+#+LATEX_CLASS_OPTIONS: [presentation]
+#+LATEX_HEADER: \usebackgroundtemplate{\includegraphics[width=\paperwidth,height=\paperheight]{watermark.pdf}}
+#+BEAMER_HEADER: \title[Using private keys in Sequoia]{Using private keys in Sequoia}
+#+BEAMER_HEADER: \titlegraphic{\url{https://gitlab.com/sequoia/pks-openpgp-card}\\ \vspace{3mm} \url{https://gitlab.com/sequoia/pks}}
+#+BEAMER_HEADER: \beamertemplatenavigationsymbolsempty
+#+BEAMER_HEADER: \setbeamertemplate{footline}[frame number]{}
+#+BEAMER_THEME: Madrid
+#+COLUMNS: %45ITEM %10BEAMER_ENV(Env) %10BEAMER_ACT(Act) %4BEAMER_COL(Col) %8BEAMER_OPT(Opt)
+
+# Convert to PDF using: C-c C-e l PV
+
+
+* Using private keys in Sequoia
+
+  # Okay, I'd like to present my work on private key stores.
+
+** Problem statement
+
+  # But first, a short description of the problem it is solving:
+  # Security sensitive people tend to use hardware tokens for storing
+  # their private keys and they want to use these tokens through
+  # Sequoia to decrypt and sign data. This apparently is a burning
+  # problem as issue #114 is our most upvoted issue to date.
+  - Problem: bring cryptographic modules of all kinds to OpenPGP
+    https://gitlab.com/sequoia-pgp/sequoia/-/issues/114
+    (+10 upvotes, most upvoted issue)
+
+  # I've developed a couple of small proof-of-concept applications to
+  # explore the problem space and found out that the first road-block
+  # is that the traits made for implementing remote keys, that is
+  # Signer and Decryptor are too OpenPGP-specific.
+  - Subproblem: Signer and Decryptor are too OpenPGP-specific
+
+  # The solution that I'm proposing decouples managing and generating
+  # OpenPGP-framed data from the underlying cryptographic primitives.
+  - Solution: decoupling OpenPGP from the underlying cryptographic
+    primitives
+
+** Coupling of Signer and Decryptor
+
+  # The issue was first brought by Robin from Nitrokey in the context
+  # of smartcard functionality and looks like this: the crate
+  # providing implementations for Signer and Decryptor needs to depend
+  # on the sequoia-openpgp crate. Then the application that uses the
+  # card objects to emit OpenPGP data needs to again depend on the
+  # sequoia-openpgp crate thus forming a diamond dependency graph.
+
+#+BEGIN_QUOTE
+ Pulling in sequoia-openpgp with > 100 dependencies, some of them
+ native, just for some enums feels just too heavy for potential
+ third-party users. ([[https://gitlab.com/sequoia-pgp/sequoia/-/issues/114#note_578757474][Comment on #114]])
+#+END_QUOTE
+[[https://jlbp.dev/what-is-a-diamond-dependency-conflict][Diamond dependency graph]]:
+
+  # Why is this problematic? Consider that openpgp-card-sequoia is
+  # developed against sequoia-openpgp-card crate version one. Then
+  # let's say that the design team introduces a change to the OpenPGP
+  # spec that can only be addressed with an incompatible library
+  # change, say, a new way of handling signature packets.
+  # sequoia-openpgp version two is released. The application wants to
+  # be up-to-date so it uses sequoia-openpgp crate version two. What
+  # about openpgp-card-sequoia? It needs to update itself to version
+  # two just because version two is released. It doesn't need anything
+  # from that crate as the cryptographic primitives that the card
+  # exposes did not change.  If openpgp-card-sequoia updates, it
+  # breaks apps that still support sequoia-openpgp version one for
+  # some reason.
+
+   [[./diamond-dep.png]]
+
+** Private Key Store Protocol
+
+  # Private Key Store decouples crypographic primitives, that rarely
+  # change, from OpenPGP data framing that may change at a difference
+  # pace.
+
+  # How does it do that? By offering a small set of operations that
+  # can be executed with no framing at all - binary data.
+   
+   High level design ideas:
+     - Provide a minimal set of cryptographic primitives: signing,
+       decryption and ECDH derivation,
+     - Simple key discovery,
+     - Extensible: e.g. public key bits,
+     - Based on HTTP.
+
+  # The dependency graph shows the relation of modules. Since neither
+  # openpgp-card or pks-openpgp-card depend transitively on
+  # sequoia-openpgp they can be developed in isolation.
+     
+  [[./pks-dep.png]]
+
+** Sequoia perspective
+
+  # From the perspective of applications that want to interact with
+  # OpenPGP data through sequoia the net crate provides a minimal API
+  # that can build a Signer or Decryptor for a given Private Key Store
+  # endpoint.
+
+  # The API asks for the endpoint, OpenPGP key that is necessary for
+  # some operations and the Password to unlock the key and returns the
+  # Signer object ready to use.
+   
+Private Key Store module provides implementations for Signer and
+Decryptor crate:
+
+#+BEGIN_SRC
+use sequoia_net::pks;
+
+match pks::unlock_signer("http://localhost:3000/", key, &p) {
+    Ok(signer) => { /* use signer for signing */ },
+    Err(e) => { eprintln!("Could not unlock signer: {:?}", e); }
+}
+#+END_SRC
+
+  # The first parameter that designates store URI allows for some
+  # degree of extensibility: for example currently =http= and =https=
+  # endpoints are supported but the work is underway to allow unix
+  # sockets to be used on compatible OSes.
+
+Store URI can be:
+  - =http://localhost:3000= - simple HTTP server for development,
+  - =https://API_KEY:@api.dms.fortanix.com/keystore/= - remote store
+    via HTTPS,
+  - =unix:///run/user/1000/pks.sock= - local key agent process.
+
+** Broader OpenPGP ecosystem perspective
+
+  # But the Private Key Store Protocol is not only about Sequoia, it's
+  # about a bigger OpenPGP ecosystem. The idea is to provide an
+  # interface that could be consumed from other OpenPGP libraries.
+
+  [[./js.png]]
+
+  # For this I've written a small 30 lines JavaScript demo of using
+  # decryption and signing using OpenPGP cards on a web page. I've got
+  # in touch with Daniel from OpenPGP.js asking for initial feedback
+  # and he remarked that it is "an interesting idea".
+  
+([[https://gitlab.com/sequoia-pgp/pks-openpgp-card/-/blob/main/index.html#L9-39][30 lines of JavaScript needed to interact with PKS server]])
+  
+#+BEGIN_QUOTE
+This is an interesting idea (Daniel Huigens, [[https://github.com/openpgpjs/openpgpjs/discussions/1432][#1432]])
+#+END_QUOTE
+
+** Even broader ecosystem perspective
+
+  # But why stop with just OpenPGP libraries if we can offer
+  # cryptographic primitives to other applications too?
+
+  # For this I've written a small ssh-agent application that
+  # communicates with the given PKS server through Unix sockets.
+
+  # These apps use socket activation as popularized by systemd so that
+  # the agent and the PKS server are started only on demand by systemd
+  # when someone wants to use them.
+
+  # One interesting point here is that there sequoia-openpgp is not a
+  # dependency of any of these apps. Since SSH doesn't care about
+  # OpenPGP framed data but has its own framing we use raw
+  # cryptographic primitives as exposed via the PKS server to sign
+  # challenges provided by SSH.
+   
+   Case study: using PKS server in SSH authentication:
+   
+#+BEGIN_SRC
+$ cat ~/.config/systemd/user/ssh-agent-pks.socket
+[Socket]
+ListenStream=%t/ssh-agent-pks.sock
+
+[Install]
+WantedBy=sockets.target
+#+END_SRC
+
+   [[./ssh-agent.png]]
+
+** Even broader ecosystem perspective (2)
+
+  # As you can see this is currently started as a user service and the
+  # socket is in user's runtime directory.
+   
+   PKS server activation:
+
+#+BEGIN_SRC
+$ cat ~/.config/systemd/user/pks-openpgp-card.socket
+[Socket]
+ListenStream=%t/pks-openpgp-card.sock
+
+[Install]
+WantedBy=sockets.target
+
+$ cat ~/.config/systemd/user/pks-openpgp-card.service
+[Service]
+ExecStart=%h/src/pep/pks-openpgp-card/target/debug/pks-openpgp-card
+Environment=RUST_LOG=debug
+#+END_SRC
+
+  # We've got end-to-end tests of the SSH agent communication via
+  # OpenSSH tools. Since during tests we don't need full systemd a
+  # small wrapper by dkg is used.
+
+  End-to-end tests using: https://gitlab.com/dkg/socket-activate/
+
+** Summary
+
+   Works today:
+     - SSH agent PKS adapter,
+     - =sq sign= and =decrypt= (among others) can utilize PKS servers
+       via HTTP(S),
+     - multiple PKS servers: OpenPGP Card, TPM,
+     - set of PKS extensions to =sq= for managing OpenPGP certs using
+       PKS remote keys: https://gitlab.com/wiktor/sq-pks/
+     - =pks-dummy= server for end-to-end testing:
+       https://gitlab.com/wiktor/pks-dummy
+     - =pks-openpgp-card= can listen on a Unix socket.
+
+** Summary: future
+
+   Work in progress:
+     - extending =sequoia_net::pks= to support =unix= URI scheme,
+     - packaging =ssh-agent-pks= and =pks-openpgp-card= for a Linux
+       distribution,
+     - more thorough end to end tests for SSH,
+     - extending [[https://gitlab.com/wiktor/git-gpg-shim][=git-gpg-shim=]] to support signing via PKS.
+
+   Ideas:
+     - implementing PKCS#11 server based on
+       https://gitlab.com/wiktor/pkcs11-openpgp/
+     - extending OpenPGP.js to support PKS:
+       https://github.com/openpgpjs/openpgpjs/discussions/1432
+     - provided a one-pks-server-to-bind-them-all solution,
+     - coax Fortanix to migrate to PKS ;-)
